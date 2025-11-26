@@ -1,8 +1,8 @@
 
-Newsletter List Upsert
+**Newsletter List Upsert**
 
 
-Files:
+**Files:**
 - /n8n/export.json         -> n8n workflow export (import into n8n)
 - /mock/lists/newsletter.json
 - /mock/idempotency.json
@@ -11,13 +11,13 @@ Files:
 - /postman/commit.sh
 - README.md
 
-How to import:
+**How to import:**
 1) In n8n, go to Workflows -> Import from file -> upload n8n/export.json
 2) Ensure n8n has filesystem access to the paths used in Function nodes (/mnt/data/...)
    - If n8n runs in Docker, mount a host directory to the container (e.g. '-v /path/on/host/mnt/data:/mnt/data')
 3) Start the workflow and POST to the webhook path shown by n8n (typically /webhook/newsletter/upsert)
 
-Notes & Caveats:
+**Notes:**
 1) Function nodes use Node's 'fs' module to read/write mock files at /mnt/data/mock/...
    - On self-hosted n8n (Linux) this path is available.
    - If your n8n is running in Docker, mount a host folder to the container and update paths.
