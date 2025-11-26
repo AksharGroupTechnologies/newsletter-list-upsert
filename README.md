@@ -1,6 +1,6 @@
 
-Newsletter List Upsert - n8n ready-to-import package
-Generated: 2025-11-26T09:41:06.472383Z
+Newsletter List Upsert
+
 
 Files:
 - /n8n/export.json         -> n8n workflow export (import into n8n)
