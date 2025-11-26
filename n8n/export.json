@@ -1,0 +1,233 @@
+{
+  "name": "LUMO::KLAVIYO::LIST_UPSERT_SIMPLE",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "newsletter/upsert",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "2",
+      "name": "Verify Org",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        500,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Verify Org\nconst allowedOrgs = ['demo-org','org-abc'];\nconst body = items[0].json;\nif(!body.org_id || !allowedOrgs.includes(body.org_id)){\n  throw {\n    statusCode:400,\n    message: 'Unknown org_id'\n  };\n}\nreturn items;\n"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Schema Validator",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        750,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Schema Validator\nconst body = items[0].json;\nconst errors = [];\nif(!body.list_name || typeof body.list_name !== 'string') errors.push('list_name required string');\nif(!Array.isArray(body.emails)) errors.push('emails required array');\nif(typeof body.dry_run !== 'boolean') errors.push('dry_run required boolean');\nif(!body.request_id) errors.push('request_id required');\n// basic UUID v4 check\nconst uuidv4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;\nif(body.request_id && !uuidv4.test(body.request_id)) errors.push('request_id must be UUID v4');\nif(errors.length){\n  throw { statusCode:400, message: errors.join('; ') };\n}\nreturn items;\n"
+      }
+    },
+    {
+      "id": "4",
+      "name": "Idempotency Guard",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1000,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Idempotency Guard - uses local mock/idempotency.json\nconst fs = require('fs');\nconst path = '/mnt/data/mock/idempotency.json';\nconst body = items[0].json;\nlet store = {};\ntry{\n  store = JSON.parse(fs.readFileSync(path).toString() || '{}');\n}catch(e){\n  store = {};\n}\nconst key = `${body.org_id}::${body.list_name}::${body.request_id}`;\nif(store[key]){\n  // return previous stored response\n  return [{ json: { __idempotent:true, previousResult: store[key] } }];\n}\n// continue; attach store and key for downstream nodes\nitems[0].json.__idempo_key = key;\nitems[0].json.__idempo_store = store;\nreturn items;\n"
+      }
+    },
+    {
+      "id": "5",
+      "name": "Fetch Current Members (Mock)",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1250,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Read mock list file\nconst fs = require('fs');\nconst path = '/mnt/data/mock/lists/newsletter.json';\nlet list = { members: [] };\ntry{\n  const j = JSON.parse(fs.readFileSync(path).toString());\n  list = j;\n}catch(e){}\nitems[0].json.current_members = list.members || [];\nreturn items;\n"
+      }
+    },
+    {
+      "id": "6",
+      "name": "Diff Calculator",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1500,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// compute to_add, already_in_list, invalid_emails\nconst emails = items[0].json.emails.map(e => (typeof e==='string'? e.trim().toLowerCase(): ''));\nconst current = new Set(items[0].json.current_members.map(e=>e.toLowerCase()));\nconst to_add = [];\nconst already_in_list = [];\nconst invalid_emails = [];\nconst emailRE = /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/;\nfor(const e of emails){\n  if(!emailRE.test(e)){ invalid_emails.push(e); continue; }\n  if(current.has(e)) already_in_list.push(e);\n  else to_add.push(e);\n}\nif(invalid_emails.length){\n  throw { statusCode:400, message: 'Invalid emails: ' + invalid_emails.slice(0,20).join(', ') };\n}\nitems[0].json.to_add = to_add;\nitems[0].json.already_in_list = already_in_list;\nitems[0].json.invalid_emails = invalid_emails;\nreturn items;\n"
+      }
+    },
+    {
+      "id": "7",
+      "name": "Dry-Run Decision",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1750,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// If dry_run, prepare response and short-circuit\nconst body = items[0].json;\nif(body.__idempotent && body.__idempotent===true){\n  return items; // pass-through to HTTP Response which will handle idempotent case\n}\nif(body.dry_run){\n  items[0].json.__dry_run_response = {\n    counts: {\n      to_add: body.to_add.length,\n      already_in_list: body.already_in_list.length\n    },\n    sample_to_add: body.to_add.slice(0,10),\n    dry_run: true,\n    status: 'dry_run'\n  };\n}\nreturn items;\n"
+      }
+    },
+    {
+      "id": "8",
+      "name": "Batch Upsert (Mock)",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2000,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Simulate batching with 429 retry\nconst fs = require('fs');\nconst body = items[0].json;\nif(body.dry_run){\n  return items;\n}\nconst batchSize = 500;\nconst batches = [];\nfor(let i=0;i<body.to_add.length;i+=batchSize){\n  batches.push(body.to_add.slice(i,i+batchSize));\n}\nconst results = { added: [], failed: [] };\nfor(const batch of batches){\n  let tries = 0;\n  let success = false;\n  while(tries < 4 && !success){\n    tries++;\n    // Simulate a 20% chance of 429 on first try\n    const rand = Math.random();\n    if(rand < 0.2 && tries < 4){\n      // simulate 429 -> wait (no real wait) and retry\n      continue;\n    } else {\n      // succeed: append all\n      results.added.push(...batch);\n      success = true;\n    }\n  }\n  if(!success){\n    results.failed.push(...batch);\n  }\n}\nitems[0].json.batch_result = results;\nreturn items;\n"
+      }
+    },
+    {
+      "id": "9",
+      "name": "Persist Result (Mock)",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2250,
+        200
+      ],
+      "parameters": {
+        "functionCode": "\n// Update mock list file and idempotency store and write audit line\nconst fs = require('fs');\nconst listPath = '/mnt/data/mock/lists/newsletter.json';\nconst idempPath = '/mnt/data/mock/idempotency.json';\nconst auditPath = '/mnt/data/audit/audit.log';\nconst body = items[0].json;\n// load list\nlet list = { members: [] };\ntry{ list = JSON.parse(fs.readFileSync(listPath).toString()); }catch(e){}\n// add newly added\nconst added = (body.batch_result && body.batch_result.added) || [];\nconst newMembers = Array.from(new Set([...(list.members||[]), ...added]));\nlist.members = newMembers;\nfs.writeFileSync(listPath, JSON.stringify(list, null, 2));\n// idempotency store\nlet store = {};\ntry{ store = JSON.parse(fs.readFileSync(idempPath).toString()); }catch(e){}\nconst key = body.__idempo_key || `${body.org_id}::${body.list_name}::${body.request_id}`;\nconst result = {\n  counts: { added: added.length, already_in_list: body.already_in_list.length },\n  sample_to_add: added.slice(0,10),\n  dry_run: !!body.dry_run,\n  status: 'committed'\n};\nstore[key] = result;\nfs.writeFileSync(idempPath, JSON.stringify(store, null, 2));\n// audit\nconst auditLine = {\n  run_id: require('crypto').randomUUID(),\n  timestamp: new Date().toISOString(),\n  org_id: body.org_id,\n  list_name: body.list_name,\n  request_id: body.request_id,\n  counts: { to_add: body.to_add.length, added: added.length, already_in_list: body.already_in_list.length },\n  dry_run: !!body.dry_run,\n  status: 'committed'\n};\nfs.appendFileSync(auditPath, JSON.stringify(auditLine) + '\\n');\nitems[0].json.persist_result = result;\nreturn items;\n"
+      }
+    },
+    {
+      "id": "10",
+      "name": "HTTP Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        2500,
+        300
+      ],
+      "parameters": {
+        "responseMode": "lastNode",
+        "responseData": "={{$json.__idempotent ? $json.previousResult : ($json.__dry_run_response || $json.persist_result || { status:'no-op' })}}",
+        "statusCode": "={{$json.__idempotent ? 200 : ($json.__dry_run_response ? 200 : 200)}}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Org",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Org": {
+      "main": [
+        [
+          {
+            "node": "Schema Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema Validator": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Guard": {
+      "main": [
+        [
+          {
+            "node": "Fetch Current Members (Mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Current Members (Mock)": {
+      "main": [
+        [
+          {
+            "node": "Diff Calculator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff Calculator": {
+      "main": [
+        [
+          {
+            "node": "Dry-Run Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Decision": {
+      "main": [
+        [
+          {
+            "node": "Batch Upsert (Mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Upsert (Mock)": {
+      "main": [
+        [
+          {
+            "node": "Persist Result (Mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Result (Mock)": {
+      "main": [
+        [
+          {
+            "node": "HTTP Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {}
+}
